@@ -2,10 +2,15 @@ package repeater
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"github.com/wyw14/cry-103/internal/telemetry"
 )
+
+// ErrStaleRepeaterReset is returned when a reset carries a generation older
+// than the active incident or the generation of the most recent resolution.
+var ErrStaleRepeaterReset = errors.New("repeater reset generation is older than the active or last-resolved incident")
 
 type IncidentSink interface {
 	OpenRepeaterIncident(repeaterID string, generation uint64) error
@@ -69,20 +74,35 @@ func (p *HealthProjector) Reset(repeaterID string, generation uint64) error {
 	if repeater == nil {
 		return nil
 	}
-	if active, ok := p.incidents.Active(repeaterID); ok && generation < active {
-		return nil
+	if p.incidents != nil {
+		active, isActive := p.incidents.Active(repeaterID)
+		lastResolution := p.incidents.LastResolution(repeaterID)
+		if (isActive && generation < active) || generation < lastResolution {
+			// An older generation must not clear an incident that a newer
+			// generation opened or that a newer reset already resolved.
+			return ErrStaleRepeaterReset
+		}
+		// Commit the resolution event before touching the projection. When the
+		// event cannot be persisted, the device keeps its tripped projection
+		// and the incident stays active, so the two states never diverge; no
+		// rollback is needed because nothing was changed yet.
+		if err := p.incidents.ResolveRepeaterIncident(repeaterID, generation); err != nil {
+			return err
+		}
+		// Re-check after the commit: a concurrent trip for a newer generation
+		// must not be masked by this (now stale) reset.
+		if active, isActive := p.incidents.Active(repeaterID); isActive && generation < active {
+			return ErrStaleRepeaterReset
+		}
 	}
+	// Event durably resolved: only now advance the projection. The generation
+	// guard inside the update is the last line of defence against a newer trip
+	// recorded concurrently.
 	repeater.update(func(current *Snapshot) {
 		if generation >= current.TripGeneration {
 			current.Health = HealthNormal
 			current.TripGeneration = generation
 		}
 	})
-	if p.incidents != nil {
-		if err := p.incidents.ResolveRepeaterIncident(repeaterID, generation); err != nil {
-			return err
-		}
-		_ = p.incidents.LastResolution(repeaterID)
-	}
 	return nil
 }
