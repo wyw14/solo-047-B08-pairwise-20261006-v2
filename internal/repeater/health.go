@@ -2,10 +2,15 @@ package repeater
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"github.com/wyw14/cry-103/internal/telemetry"
 )
+
+// ErrStaleGeneration is returned when a reset carries a generation older than
+// the generation of the currently active incident.
+var ErrStaleGeneration = errors.New("repeater reset rejected: stale generation")
 
 type IncidentSink interface {
 	OpenRepeaterIncident(repeaterID string, generation uint64) error
@@ -62,6 +67,11 @@ func (p *HealthProjector) ApplySample(_ context.Context, sample telemetry.Sample
 	return nil
 }
 
+// Reset clears a latched trip for the given generation. The resolution event
+// is committed before the health projection is updated, so a failed event
+// persistence leaves the repeater visibly tripped instead of showing a
+// recovery that never happened. Resets older than the active incident
+// generation are rejected before either side is touched.
 func (p *HealthProjector) Reset(repeaterID string, generation uint64) error {
 	p.mu.RLock()
 	repeater := p.repeaters[repeaterID]
@@ -69,20 +79,31 @@ func (p *HealthProjector) Reset(repeaterID string, generation uint64) error {
 	if repeater == nil {
 		return nil
 	}
-	if active, ok := p.incidents.Active(repeaterID); ok && generation < active {
-		return nil
+	if p.incidents != nil {
+		if active, ok := p.incidents.Active(repeaterID); ok && generation < active {
+			return ErrStaleGeneration
+		}
+		// Commit the event first. On failure the projection stays latched,
+		// matching the incident that remains active.
+		if err := p.incidents.ResolveRepeaterIncident(repeaterID, generation); err != nil {
+			return err
+		}
 	}
-	repeater.update(func(current *Snapshot) {
+	before := repeater.Snapshot()
+	after := repeater.update(func(current *Snapshot) {
 		if generation >= current.TripGeneration {
 			current.Health = HealthNormal
 			current.TripGeneration = generation
 		}
 	})
-	if p.incidents != nil {
-		if err := p.incidents.ResolveRepeaterIncident(repeaterID, generation); err != nil {
+	// Compensation: the event is resolved but the projection could not clear
+	// itself (its latched trip is newer than the reset generation). Reopen the
+	// incident at the projection's trip generation so event and projection
+	// never disagree about whether the repeater is faulted.
+	if p.incidents != nil && before.Health == HealthTripped && after.Health == HealthTripped {
+		if err := p.incidents.OpenRepeaterIncident(repeaterID, after.TripGeneration); err != nil {
 			return err
 		}
-		_ = p.incidents.LastResolution(repeaterID)
 	}
 	return nil
 }
